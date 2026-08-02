@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>fouryi_cad_companion</name>
+  <displayname>4yi CAD Companion</displayname>
+  <version>0.4.0</version>
+  <date>2026-08-02</date>
+  <description>4yi CAD companion panel and remote-session bridge for FreeCAD.</description>
+  <maintainer email="support@4yi.ai">4yi CAD</maintainer>
+  <license>Proprietary</license>
+  <url type="repository">https://github.com/4yi-ai/4yi-cad</url>
+  <icon>Resources/icons/fouryi_cad_companion.svg</icon>
+  <content>
+    <workbench>
+      <classname>FourYiCadCompanionWorkbench</classname>
+      <subdirectory>.</subdirectory>
+    </workbench>
+  </content>
+</package>
