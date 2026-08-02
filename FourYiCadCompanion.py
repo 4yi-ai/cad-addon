@@ -56,6 +56,8 @@ SUPPORTED_COMMANDS = [
 RECENT_EVENTS: list[dict[str, Any]] = []
 _BRIDGE_RUNTIME: "InProcessBridgeRuntime | None" = None
 _COMMANDS_REGISTERED = False
+_PANEL_DIALOG = None
+_PANEL_AUTOSTARTED = False
 
 JsonPost = Callable[[str, dict[str, Any], float], dict[str, Any]]
 
@@ -1054,6 +1056,28 @@ def autostart_remote_bridge() -> None:
         start_remote_bridge()
 
 
+def autostart_companion_panel() -> None:
+    if not truthy(os.environ.get("CAD_COMPANION_PANEL_AUTOSTART")):
+        return
+    global _PANEL_AUTOSTARTED
+    if _PANEL_AUTOSTARTED:
+        return
+    _PANEL_AUTOSTARTED = True
+
+    def _open_panel() -> None:
+        try:
+            show_panel()
+        except Exception as exc:
+            if App is not None:
+                App.Console.PrintError("4yi CAD panel autostart failed: %s\n" % exc)
+
+    delay_ms = int(env_float(os.environ, "CAD_COMPANION_PANEL_DELAY_SECONDS", 2.5) * 1000)
+    if QtCore is not None:
+        QtCore.QTimer.singleShot(delay_ms, _open_panel)
+    else:
+        _open_panel()
+
+
 def parse_measurement_value(text: str) -> float | None:
     import re
 
@@ -1338,7 +1362,9 @@ class CompanionTaskPanel:
 def show_panel() -> None:
     if QtWidgets is None:
         raise RuntimeError("Qt widgets are not available")
+    global _PANEL_DIALOG
     panel = CompanionTaskPanel()
+    _PANEL_DIALOG = panel
     if Gui is not None and hasattr(Gui, "Control"):
         Gui.Control.showDialog(panel)
     else:
