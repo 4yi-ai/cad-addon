@@ -422,6 +422,14 @@ def panel_action_url(env: dict[str, str]) -> str:
     raise RuntimeError("CAD_PANEL_ACTION_URL is required")
 
 
+def panel_action_timeout(env: dict[str, str]) -> float:
+    return env_float(
+        env,
+        "CAD_PANEL_ACTION_HTTP_TIMEOUT_SECONDS",
+        env_float(env, "CAD_BRIDGE_HTTP_TIMEOUT_SECONDS", 10.0),
+    )
+
+
 def write_command_journal(
     command: dict[str, Any],
     payload: dict[str, Any],
@@ -1125,6 +1133,18 @@ def macro_for_selected_numeric_edit(text: str, selection: dict[str, Any] | None 
     )
 
 
+def macro_for_prompt_if_selected_numeric_edit(
+    text: str,
+    selection: dict[str, Any] | None = None,
+) -> str | None:
+    selection = selection or current_selection()
+    active = selection.get("active_object") or {}
+    object_name_value = active.get("name") or active.get("label") or ""
+    if not object_name_value or parse_measurement_value(text) is None:
+        return None
+    return macro_for_selected_numeric_edit(text, selection)
+
+
 def submit_panel_action(action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = payload or {}
     env = os.environ
@@ -1142,7 +1162,7 @@ def submit_panel_action(action: str, payload: dict[str, Any] | None = None) -> d
                 "document_tree": current_document_tree(),
             },
         },
-        env_float(env, "CAD_BRIDGE_HTTP_TIMEOUT_SECONDS", 10.0),
+        panel_action_timeout(env),
     )
 
 
@@ -1161,12 +1181,14 @@ def queue_bridge_command(op: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 def submit_prompt_from_panel(prompt: str) -> dict[str, Any]:
     selection = current_selection()
-    macro = macro_for_selected_numeric_edit(prompt, selection)
+    macro = macro_for_prompt_if_selected_numeric_edit(prompt, selection)
     payload = {"prompt": prompt, "selection": selection, "macro": macro}
     try:
         return submit_panel_action("prompt", payload)
     except Exception:
-        return queue_bridge_command("run_macro", {"instruction": prompt, "selection": selection, "macro": macro})
+        if macro:
+            return queue_bridge_command("run_macro", {"instruction": prompt, "selection": selection, "macro": macro})
+        raise
 
 
 def redacted_environment(env: dict[str, str] | None = None) -> dict[str, Any]:
@@ -1183,6 +1205,7 @@ def redacted_environment(env: dict[str, str] | None = None) -> dict[str, Any]:
         "CAD_BRIDGE_COMMAND_RESULT_URL_BASE",
         "CAD_BRIDGE_SAVE_URL",
         "CAD_PANEL_ACTION_URL",
+        "CAD_PANEL_ACTION_HTTP_TIMEOUT_SECONDS",
     ]
     result = {}
     for key in keys:
