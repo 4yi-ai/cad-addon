@@ -9,6 +9,7 @@ import platform
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -46,6 +47,7 @@ COMMAND_STOP_BRIDGE = "FourYi_StopBridge"
 COMMAND_EXPORT_SUPPORT_BUNDLE = "FourYi_ExportSupportBundle"
 SUPPORTED_COMMANDS = [
     "inspect_document",
+    "load_model",
     "select_object",
     "run_macro",
     "save_revision",
@@ -447,6 +449,146 @@ def write_command_journal(
     }
 
 
+def safe_workspace_filename(value: str | None, default: str) -> str:
+    raw = (value or "").strip() or default
+    name = Path(raw).name
+    safe = "".join(ch for ch in name if ch.isalnum() or ch in {"-", "_", "."})
+    safe = safe or default
+    if not safe.lower().endswith(".fcstd"):
+        safe = "%s.FCStd" % safe
+    return safe
+
+
+def resolve_control_plane_url(path_or_url: str, env: dict[str, str]) -> str:
+    value = path_or_url.strip()
+    if not value:
+        raise BridgeCommandError("fcstd_source_required", "load_model requires fcstd_url or fcstd_b64")
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme and parsed.netloc:
+        return value
+    base = (
+        env.get("CAD_CONTROL_PLANE_URL")
+        or env.get("CAD_GUI_SESSION_CONTROL_PLANE_URL")
+        or ""
+    ).strip()
+    if not base:
+        raise BridgeCommandError(
+            "control_plane_url_required",
+            "relative fcstd_url requires CAD_CONTROL_PLANE_URL",
+            details={"fcstd_url": value},
+        )
+    if value.startswith("/"):
+        return urllib.parse.urljoin(base.rstrip("/") + "/", value.lstrip("/"))
+    return urllib.parse.urljoin(base.rstrip("/") + "/", value)
+
+
+def load_model_bytes(payload: dict[str, Any], env: dict[str, str], timeout: float) -> bytes:
+    fcstd_b64 = payload.get("fcstd_b64")
+    if fcstd_b64:
+        try:
+            return base64.b64decode(str(fcstd_b64), validate=True)
+        except Exception as exc:
+            raise BridgeCommandError("invalid_fcstd_b64", "load_model fcstd_b64 is invalid") from exc
+
+    fcstd_url = payload.get("fcstd_url") or payload.get("artifact_url") or payload.get("url")
+    if not fcstd_url:
+        raise BridgeCommandError("fcstd_source_required", "load_model requires fcstd_url or fcstd_b64")
+    url = resolve_control_plane_url(str(fcstd_url), env)
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/vnd.freecad,application/octet-stream"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise BridgeCommandError(
+            "fcstd_download_failed",
+            "load_model could not download FCStd artifact",
+            details={"status": exc.code, "body": body[:1000], "url": url},
+        ) from exc
+    if not data:
+        raise BridgeCommandError("empty_fcstd", "load_model received an empty FCStd artifact")
+    return data
+
+
+def close_existing_documents() -> None:
+    if App is None or not hasattr(App, "closeDocument"):
+        return
+    try:
+        docs = App.listDocuments() if hasattr(App, "listDocuments") else {}
+        names = list(docs.keys()) if isinstance(docs, dict) else []
+    except Exception:
+        names = []
+    for name in names:
+        try:
+            App.closeDocument(str(name))
+        except Exception:
+            pass
+
+
+def fit_active_view() -> None:
+    if Gui is None:
+        return
+    try:
+        view = Gui.ActiveDocument.ActiveView
+        if hasattr(view, "fitAll"):
+            view.fitAll()
+    except Exception:
+        pass
+
+
+def execute_load_model(payload: dict[str, Any], env: dict[str, str], timeout: float) -> dict[str, Any]:
+    if App is None:
+        raise BridgeCommandError("freecad_unavailable", "FreeCAD is not available")
+    root = workspace(env)
+    root.mkdir(parents=True, exist_ok=True)
+    filename = safe_workspace_filename(
+        payload.get("filename") or payload.get("name"),
+        "current-session.FCStd",
+    )
+    path = root / filename
+    path.write_bytes(load_model_bytes(payload, env, timeout))
+    if payload.get("close_existing", True) is not False:
+        close_existing_documents()
+
+    before_names = document_object_names(active_document())
+    doc = None
+    if hasattr(App, "openDocument"):
+        doc = App.openDocument(str(path))
+    doc = doc or active_document()
+    if doc is not None and hasattr(App, "setActiveDocument"):
+        try:
+            App.setActiveDocument(str(getattr(doc, "Name", "")))
+        except Exception:
+            pass
+    recompute = {"status": "not_run"}
+    if doc is not None and payload.get("recompute", True) is not False and hasattr(doc, "recompute"):
+        doc.recompute()
+        recompute = {"status": "ok"}
+    env["SESSION_FCSTD_PATH"] = str(path)
+    if payload.get("version_id"):
+        env["CAD_CURRENT_VERSION_ID"] = str(payload["version_id"])
+    fit_active_view()
+    after_names = document_object_names(doc)
+    append_event("model_loaded", {"path": str(path), "version_id": payload.get("version_id")})
+    return {
+        "document_tree": document_tree_from_document(doc),
+        "selection": current_selection(),
+        "active_document_path": str(path),
+        "loaded_model": {
+            "path": str(path),
+            "filename": path.name,
+            "version_id": payload.get("version_id"),
+        },
+        "changed_objects": sorted(before_names ^ after_names),
+        "console": ["Loaded %s" % path.name],
+        "recompute_status": recompute,
+        "undo": {"available": document_undo_available(doc), "source": "freecad_addon"},
+    }
+
+
 def document_object_names(doc) -> set[str]:
     if doc is None:
         return set()
@@ -697,6 +839,8 @@ def execute_command(
                 "recompute_status": {"status": "not_run"},
                 "undo": {"available": document_undo_available(active_document()), "source": "freecad_addon"},
             }
+        elif op == "load_model":
+            result = execute_load_model(payload, env, timeout)
         elif op == "select_object":
             result = execute_select_object(payload)
         elif op == "run_macro":
