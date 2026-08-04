@@ -7,10 +7,11 @@
   <description>4yi CAD companion panel and remote-session bridge for FreeCAD.</description>
   <maintainer email="support@4yi.ai">4yi CAD</maintainer>
   <license>Proprietary</license>
-  <url type="repository">https://github.com/4yi-ai/4yi-cad</url>
+  <url type="repository" branch="main">https://github.com/4yi-ai/cad-addon</url>
   <icon>Resources/icons/fouryi_cad_companion.svg</icon>
   <content>
     <workbench>
+      <freecadmin>1.0</freecadmin>
       <classname>FourYiCadCompanionWorkbench</classname>
       <subdirectory>.</subdirectory>
     </workbench>
