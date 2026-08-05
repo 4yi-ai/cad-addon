@@ -47,6 +47,7 @@ COMMAND_OPEN_PANEL = "FourYi_OpenPanel"
 COMMAND_START_BRIDGE = "FourYi_StartBridge"
 COMMAND_STOP_BRIDGE = "FourYi_StopBridge"
 COMMAND_EXPORT_SUPPORT_BUNDLE = "FourYi_ExportSupportBundle"
+COMMAND_CONNECTION_SETTINGS = "FourYi_ConnectionSettings"
 SUPPORTED_COMMANDS = [
     "inspect_document",
     "load_model",
@@ -91,6 +92,7 @@ def commands() -> list[str]:
         COMMAND_START_BRIDGE,
         COMMAND_STOP_BRIDGE,
         COMMAND_EXPORT_SUPPORT_BUNDLE,
+        COMMAND_CONNECTION_SETTINGS,
     ]
 
 
@@ -202,6 +204,42 @@ def auth_headers(env: dict[str, str]) -> dict[str, str]:
     if not token:
         return {}
     return {"Authorization": "Bearer %s" % token}
+
+
+def test_connection(server_url: str, timeout: float = 5.0) -> tuple[bool, str]:
+    """GET {server_url}/healthz (no auth). Returns (ok, short message)."""
+    url = "%s/healthz" % (server_url or "").rstrip("/")
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = getattr(response, "status", None)
+            if status is None:
+                status = response.getcode()
+    except urllib.error.HTTPError as exc:
+        return False, "HTTP %s: %s" % (exc.code, exc.reason)
+    except urllib.error.URLError as exc:
+        return False, str(exc.reason)
+    except Exception as exc:  # pragma: no cover - defensive catch-all
+        return False, str(exc)
+    if 200 <= status < 300:
+        return True, "OK (HTTP %s)" % status
+    return False, "HTTP %s" % status
+
+
+def save_connection_params(server_url: str, api_token: str, params=None) -> None:
+    """Persist ServerUrl (stripped) and, only if non-empty, ApiToken.
+
+    An empty api_token must NOT overwrite an existing stored token -- this is
+    what lets a user re-save just the ServerUrl without re-entering (or
+    accidentally clearing) a previously-configured token.
+    """
+    params = params if params is not None else addon_params()
+    if params is None:
+        return
+    params.SetString("ServerUrl", (server_url or "").strip())
+    token = (api_token or "").strip()
+    if token:
+        params.SetString("ApiToken", token)
 
 
 # Computed once at import time: in container/kiosk mode (CAD_BRIDGE_POLL_URL
@@ -1584,6 +1622,102 @@ class ExportSupportBundleCommand:
         return App is not None
 
 
+class ConnectionSettingsDialog:
+    """「4yi: 连接设置…」dialog: ServerUrl + ApiToken, test-connection, save.
+
+    Pure Qt assembly around test_connection()/save_connection_params(); no
+    logic lives here (both functions are unit-tested without Qt/FreeCAD).
+    The API token is only ever passed to save_connection_params() -- it is
+    never logged, appended to RECENT_EVENTS, or written into a support
+    bundle.
+    """
+
+    def __init__(self) -> None:
+        if QtWidgets is None:
+            raise RuntimeError("Qt widgets are not available")
+        params = addon_params()
+        self.form = QtWidgets.QWidget()
+        self.form.setWindowTitle("4yi CAD - 连接设置")
+        layout = QtWidgets.QVBoxLayout(self.form)
+
+        layout.addWidget(QtWidgets.QLabel("Server URL"))
+        self.server_url_input = QtWidgets.QLineEdit()
+        self.server_url_input.setPlaceholderText("https://cad.example.com")
+        if params is not None:
+            self.server_url_input.setText(params.GetString("ServerUrl", "") or "")
+        layout.addWidget(self.server_url_input)
+
+        layout.addWidget(QtWidgets.QLabel("API Token"))
+        self.api_token_input = QtWidgets.QLineEdit()
+        self.api_token_input.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.api_token_input.setPlaceholderText("留空则保留已保存的 Token")
+        layout.addWidget(self.api_token_input)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.test_button = QtWidgets.QPushButton("测试连接")
+        self.save_button = QtWidgets.QPushButton("保存")
+        buttons.addWidget(self.test_button)
+        buttons.addWidget(self.save_button)
+        layout.addLayout(buttons)
+
+        self.result_label = QtWidgets.QLabel("")
+        self.result_label.setWordWrap(True)
+        layout.addWidget(self.result_label)
+
+        self.test_button.clicked.connect(self.on_test_connection)
+        self.save_button.clicked.connect(self.on_save)
+
+    def on_test_connection(self) -> None:
+        server_url = self.server_url_input.text().strip()
+        if not server_url:
+            self.result_label.setText("请先填写 Server URL")
+            return
+        ok, message = test_connection(server_url)
+        self.result_label.setText(("✓ " + message) if ok else ("✗ " + message))
+
+    def on_save(self) -> None:
+        server_url = self.server_url_input.text()
+        api_token = self.api_token_input.text()
+        save_connection_params(server_url, api_token)
+        self.api_token_input.clear()
+        self.result_label.setText("已保存,重启 FreeCAD 生效")
+
+    def accept(self) -> bool:
+        return True
+
+    def reject(self) -> bool:
+        return True
+
+
+_CONNECTION_SETTINGS_DIALOG = None
+
+
+def show_connection_settings() -> None:
+    if QtWidgets is None:
+        raise RuntimeError("Qt widgets are not available")
+    global _CONNECTION_SETTINGS_DIALOG
+    dialog = ConnectionSettingsDialog()
+    _CONNECTION_SETTINGS_DIALOG = dialog
+    if Gui is not None and hasattr(Gui, "Control"):
+        Gui.Control.showDialog(dialog)
+    else:
+        dialog.form.show()
+
+
+class ConnectionSettingsCommand:
+    def GetResources(self):
+        return {
+            "MenuText": "4yi: 连接设置...",
+            "ToolTip": "配置 4yi CAD Server URL / API Token,并测试连接。",
+        }
+
+    def Activated(self):
+        show_connection_settings()
+
+    def IsActive(self):
+        return App is not None
+
+
 def register_commands() -> None:
     global _COMMANDS_REGISTERED
     if _COMMANDS_REGISTERED or Gui is None:
@@ -1593,6 +1727,7 @@ def register_commands() -> None:
         COMMAND_START_BRIDGE: StartBridgeCommand(),
         COMMAND_STOP_BRIDGE: StopBridgeCommand(),
         COMMAND_EXPORT_SUPPORT_BUNDLE: ExportSupportBundleCommand(),
+        COMMAND_CONNECTION_SETTINGS: ConnectionSettingsCommand(),
     }
     for name, command in mapping.items():
         try:
