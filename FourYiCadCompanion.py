@@ -584,6 +584,29 @@ def resolve_control_plane_url(path_or_url: str, env: dict[str, str]) -> str:
     return urllib.parse.urljoin(base.rstrip("/") + "/", value)
 
 
+def _url_is_control_plane(url: str, env: dict[str, str]) -> bool:
+    """True iff `url`'s host matches the configured control-plane host.
+
+    The Bearer token is only for our control plane. A load_model command may
+    carry an already-absolute artifact URL (e.g. a presigned S3/CDN link);
+    attaching the token to such a third-party host would leak it into that
+    host's access logs. Only attach auth when the resolved host is ours.
+    """
+    base = (
+        env.get("CAD_CONTROL_PLANE_URL")
+        or env.get("CAD_GUI_SESSION_CONTROL_PLANE_URL")
+        or ""
+    ).strip()
+    if not base:
+        return False
+    try:
+        base_host = urllib.parse.urlparse(base).netloc.lower()
+        target_host = urllib.parse.urlparse(url).netloc.lower()
+    except ValueError:
+        return False
+    return bool(base_host) and base_host == target_host
+
+
 def load_model_bytes(payload: dict[str, Any], env: dict[str, str], timeout: float) -> bytes:
     fcstd_b64 = payload.get("fcstd_b64")
     if fcstd_b64:
@@ -597,7 +620,8 @@ def load_model_bytes(payload: dict[str, Any], env: dict[str, str], timeout: floa
         raise BridgeCommandError("fcstd_source_required", "load_model requires fcstd_url or fcstd_b64")
     url = resolve_control_plane_url(str(fcstd_url), env)
     headers = {"Accept": "application/vnd.freecad,application/octet-stream"}
-    headers.update(auth_headers(env))
+    if _url_is_control_plane(url, env):
+        headers.update(auth_headers(env))
     request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -1039,18 +1063,19 @@ class InProcessBridgeRuntime:
     def __init__(
         self,
         env: dict[str, str] | None = None,
-        http_post: JsonPost = post_json,
+        http_post: JsonPost | None = None,
     ) -> None:
         self.env = env if env is not None else EFFECTIVE_ENV
         # The bridge endpoints (heartbeat/poll/command-result/save) are under
         # the server's guarded prefix, so in remote mode every call must carry
         # the Bearer token. The JsonPost seam is 3-arg (url, payload, timeout)
         # and the two loop test fixtures inject 3-arg fakes, so rather than
-        # widen the alias we bind self.env into the DEFAULT post_json here —
-        # injected fakes (http_post is not post_json) pass through unchanged,
-        # and in container/kiosk mode env carries no CAD_API_TOKEN so this is a
-        # no-op (auth_headers stays empty).
-        if http_post is post_json:
+        # widen the alias we bind self.env into the default post_json here —
+        # an injected http_post passes through unchanged, and in container/kiosk
+        # mode env carries no CAD_API_TOKEN so this is a no-op (auth_headers
+        # stays empty). Default is None (not post_json) so the wrapper resolves
+        # the module-level post_json at call time, honoring monkeypatching.
+        if http_post is None:
             self.http_post = lambda url, payload, timeout: post_json(
                 url, payload, timeout, self.env
             )
