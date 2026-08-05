@@ -189,7 +189,7 @@ def remote_overlay_env(
         "CAD_REMOTE_SESSION_ID": session_id,
         "CAD_BRIDGE_POLL_URL": "%s/api/freecad/sessions/%s/bridge/poll" % (base, session_id),
         "CAD_BRIDGE_HEARTBEAT_URL": "%s/api/freecad/sessions/%s/bridge/heartbeat" % (base, session_id),
-        "CAD_BRIDGE_SAVE_URL": "%s/api/freecad/sessions/%s/bridge/save" % (base, session_id),
+        "CAD_BRIDGE_SAVE_URL": "%s/api/freecad/sessions/%s/save" % (base, session_id),
         "CAD_CONTROL_PLANE_URL": base,
     }
     if api_token:
