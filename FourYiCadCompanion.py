@@ -71,8 +71,8 @@ def t(zh: str, en: str) -> str:
     return zh if _ui_language() == "zh" else en
 
 
-ADDON_VERSION = "0.4.0"
-USER_AGENT = "4yi-freecad-companion/0.4.0"
+ADDON_VERSION = "0.4.1"
+USER_AGENT = "4yi-freecad-companion/0.4.1"
 PARAM_GROUP_PATH = "User parameter:BaseApp/Preferences/Mod/FourYiCad"
 COMMAND_OPEN_PANEL = "FourYi_OpenPanel"
 COMMAND_START_BRIDGE = "FourYi_StartBridge"
