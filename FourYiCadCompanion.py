@@ -1042,7 +1042,20 @@ class InProcessBridgeRuntime:
         http_post: JsonPost = post_json,
     ) -> None:
         self.env = env if env is not None else EFFECTIVE_ENV
-        self.http_post = http_post
+        # The bridge endpoints (heartbeat/poll/command-result/save) are under
+        # the server's guarded prefix, so in remote mode every call must carry
+        # the Bearer token. The JsonPost seam is 3-arg (url, payload, timeout)
+        # and the two loop test fixtures inject 3-arg fakes, so rather than
+        # widen the alias we bind self.env into the DEFAULT post_json here —
+        # injected fakes (http_post is not post_json) pass through unchanged,
+        # and in container/kiosk mode env carries no CAD_API_TOKEN so this is a
+        # no-op (auth_headers stays empty).
+        if http_post is post_json:
+            self.http_post = lambda url, payload, timeout: post_json(
+                url, payload, timeout, self.env
+            )
+        else:
+            self.http_post = http_post
         self.timer = None
         self.running = False
         self.busy = False
