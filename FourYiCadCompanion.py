@@ -4,6 +4,7 @@ import base64
 import contextlib
 import io
 import json
+import locale
 import os
 import platform
 import secrets
@@ -38,6 +39,36 @@ except Exception:
         except Exception:
             QtCore = None
             QtWidgets = None
+
+
+def _ui_language() -> str:
+    """Return 'zh' or 'en' from FreeCAD's UI language, defaulting to 'en'.
+
+    Reads User parameter:BaseApp/Preferences/General -> Language (e.g. "Chinese
+    Simplified", "English"). Falls back to the OS locale, then 'en'.
+    """
+    lang = ""
+    if App is not None:
+        try:
+            lang = App.ParamGet("User parameter:BaseApp/Preferences/General").GetString("Language", "") or ""
+        except Exception:
+            lang = ""
+    lang = lang.strip().lower()
+    if "chinese" in lang or lang.startswith("zh"):
+        return "zh"
+    if not lang:
+        try:
+            loc = (locale.getdefaultlocale()[0] or "").lower()
+            if loc.startswith("zh"):
+                return "zh"
+        except Exception:
+            pass
+    return "en"
+
+
+def t(zh: str, en: str) -> str:
+    """Pick the zh or en string for the current FreeCAD UI language."""
+    return zh if _ui_language() == "zh" else en
 
 
 ADDON_VERSION = "0.4.0"
@@ -1440,21 +1471,21 @@ class CompanionTaskPanel:
         self.context_label = QtWidgets.QLabel("")
         self.context_label.setWordWrap(True)
         self.prompt_input = QtWidgets.QLineEdit()
-        self.prompt_input.setPlaceholderText("Prompt / modify selected object")
+        self.prompt_input.setPlaceholderText(t("输入指令 / 修改选中对象", "Prompt / modify selected object"))
         self.patch_id_input = QtWidgets.QLineEdit()
-        self.patch_id_input.setPlaceholderText("Patch ID")
+        self.patch_id_input.setPlaceholderText(t("补丁 ID", "Patch ID"))
         self.output = QtWidgets.QPlainTextEdit()
         self.output.setReadOnly(True)
         buttons = QtWidgets.QGridLayout()
-        self.refresh_button = QtWidgets.QPushButton("Refresh")
-        self.start_button = QtWidgets.QPushButton("Start Bridge")
-        self.stop_button = QtWidgets.QPushButton("Stop Bridge")
-        self.explain_button = QtWidgets.QPushButton("Explain Object")
-        self.prompt_button = QtWidgets.QPushButton("Send Prompt")
-        self.generate_patch_button = QtWidgets.QPushButton("Generate Patch")
-        self.accept_patch_button = QtWidgets.QPushButton("Accept Patch")
-        self.reject_patch_button = QtWidgets.QPushButton("Reject Patch")
-        self.bundle_button = QtWidgets.QPushButton("Support Bundle")
+        self.refresh_button = QtWidgets.QPushButton(t("刷新", "Refresh"))
+        self.start_button = QtWidgets.QPushButton(t("启动桥接", "Start Bridge"))
+        self.stop_button = QtWidgets.QPushButton(t("停止桥接", "Stop Bridge"))
+        self.explain_button = QtWidgets.QPushButton(t("解释对象", "Explain Object"))
+        self.prompt_button = QtWidgets.QPushButton(t("发送指令", "Send Prompt"))
+        self.generate_patch_button = QtWidgets.QPushButton(t("生成补丁", "Generate Patch"))
+        self.accept_patch_button = QtWidgets.QPushButton(t("接受补丁", "Accept Patch"))
+        self.reject_patch_button = QtWidgets.QPushButton(t("拒绝补丁", "Reject Patch"))
+        self.bundle_button = QtWidgets.QPushButton(t("支持包", "Support Bundle"))
         for index, button in enumerate(
             [
                 self.refresh_button,
@@ -1491,16 +1522,21 @@ class CompanionTaskPanel:
         active = diagnostics["selection"].get("active_object") or {}
         doc = diagnostics["document_tree"].get("document") or {}
         self.status_label.setText(
-            "Project %s | Revision %s | Bridge %s"
+            t("项目 %s | 版本 %s | 桥接 %s", "Project %s | Revision %s | Bridge %s")
             % (
-                EFFECTIVE_ENV.get("CAD_PROJECT_ID") or EFFECTIVE_ENV.get("CAD_WORKBENCH_SESSION_ID") or "not configured",
-                EFFECTIVE_ENV.get("CAD_CURRENT_VERSION_ID") or "not configured",
-                "running" if diagnostics["bridge"]["running"] else "stopped",
+                EFFECTIVE_ENV.get("CAD_PROJECT_ID")
+                or EFFECTIVE_ENV.get("CAD_WORKBENCH_SESSION_ID")
+                or t("未配置", "not configured"),
+                EFFECTIVE_ENV.get("CAD_CURRENT_VERSION_ID") or t("未配置", "not configured"),
+                t("运行中", "running") if diagnostics["bridge"]["running"] else t("已停止", "stopped"),
             )
         )
         self.context_label.setText(
-            "Document %s | Selection %s"
-            % (doc.get("name") or "none", active.get("label") or active.get("name") or "none")
+            t("文档 %s | 选择 %s", "Document %s | Selection %s")
+            % (
+                doc.get("name") or t("无", "none"),
+                active.get("label") or active.get("name") or t("无", "none"),
+            )
         )
         self.output.setPlainText(json.dumps(diagnostics, ensure_ascii=False, indent=2))
 
@@ -1544,7 +1580,7 @@ class CompanionTaskPanel:
 
     def export_bundle(self) -> None:
         path = export_support_bundle()
-        self.output.setPlainText("Support bundle written to %s" % path)
+        self.output.setPlainText(t("支持包已写入 %s", "Support bundle written to %s") % path)
 
     def accept(self) -> bool:
         return True
@@ -1568,8 +1604,8 @@ def show_panel() -> None:
 class OpenPanelCommand:
     def GetResources(self):
         return {
-            "MenuText": "Open 4yi CAD Panel",
-            "ToolTip": "Open the 4yi CAD companion panel.",
+            "MenuText": t("打开 4yi CAD 面板", "Open 4yi CAD Panel"),
+            "ToolTip": t("打开 4yi CAD 助手面板。", "Open the 4yi CAD companion panel."),
         }
 
     def Activated(self):
@@ -1582,8 +1618,8 @@ class OpenPanelCommand:
 class StartBridgeCommand:
     def GetResources(self):
         return {
-            "MenuText": "Start 4yi Bridge",
-            "ToolTip": "Start the 4yi remote-session bridge.",
+            "MenuText": t("启动 4yi 桥接", "Start 4yi Bridge"),
+            "ToolTip": t("启动 4yi 远程会话桥接。", "Start the 4yi remote-session bridge."),
         }
 
     def Activated(self):
@@ -1596,8 +1632,8 @@ class StartBridgeCommand:
 class StopBridgeCommand:
     def GetResources(self):
         return {
-            "MenuText": "Stop 4yi Bridge",
-            "ToolTip": "Stop the 4yi remote-session bridge.",
+            "MenuText": t("停止 4yi 桥接", "Stop 4yi Bridge"),
+            "ToolTip": t("停止 4yi 远程会话桥接。", "Stop the 4yi remote-session bridge."),
         }
 
     def Activated(self):
@@ -1610,8 +1646,8 @@ class StopBridgeCommand:
 class ExportSupportBundleCommand:
     def GetResources(self):
         return {
-            "MenuText": "Export 4yi Support Bundle",
-            "ToolTip": "Write diagnostics for the 4yi CAD companion.",
+            "MenuText": t("导出 4yi 支持包", "Export 4yi Support Bundle"),
+            "ToolTip": t("导出 4yi CAD 助手的诊断信息。", "Write diagnostics for the 4yi CAD companion."),
         }
 
     def Activated(self):
@@ -1637,25 +1673,25 @@ class ConnectionSettingsDialog:
             raise RuntimeError("Qt widgets are not available")
         params = addon_params()
         self.form = QtWidgets.QWidget()
-        self.form.setWindowTitle("4yi CAD - 连接设置")
+        self.form.setWindowTitle(t("4yi CAD - 连接设置", "4yi CAD - Connection Settings"))
         layout = QtWidgets.QVBoxLayout(self.form)
 
-        layout.addWidget(QtWidgets.QLabel("Server URL"))
+        layout.addWidget(QtWidgets.QLabel(t("服务器地址", "Server URL")))
         self.server_url_input = QtWidgets.QLineEdit()
         self.server_url_input.setPlaceholderText("https://cad.example.com")
         if params is not None:
             self.server_url_input.setText(params.GetString("ServerUrl", "") or "")
         layout.addWidget(self.server_url_input)
 
-        layout.addWidget(QtWidgets.QLabel("API Token"))
+        layout.addWidget(QtWidgets.QLabel(t("API Token", "API Token")))
         self.api_token_input = QtWidgets.QLineEdit()
         self.api_token_input.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.api_token_input.setPlaceholderText("留空则保留已保存的 Token")
+        self.api_token_input.setPlaceholderText(t("留空则保留已保存的 Token", "Leave blank to keep the saved token"))
         layout.addWidget(self.api_token_input)
 
         buttons = QtWidgets.QHBoxLayout()
-        self.test_button = QtWidgets.QPushButton("测试连接")
-        self.save_button = QtWidgets.QPushButton("保存")
+        self.test_button = QtWidgets.QPushButton(t("测试连接", "Test connection"))
+        self.save_button = QtWidgets.QPushButton(t("保存", "Save"))
         buttons.addWidget(self.test_button)
         buttons.addWidget(self.save_button)
         layout.addLayout(buttons)
@@ -1670,7 +1706,7 @@ class ConnectionSettingsDialog:
     def on_test_connection(self) -> None:
         server_url = self.server_url_input.text().strip()
         if not server_url:
-            self.result_label.setText("请先填写 Server URL")
+            self.result_label.setText(t("请先填写 Server URL", "Please enter the Server URL first"))
             return
         ok, message = test_connection(server_url)
         self.result_label.setText(("✓ " + message) if ok else ("✗ " + message))
@@ -1680,7 +1716,7 @@ class ConnectionSettingsDialog:
         api_token = self.api_token_input.text()
         save_connection_params(server_url, api_token)
         self.api_token_input.clear()
-        self.result_label.setText("已保存,重启 FreeCAD 生效")
+        self.result_label.setText(t("已保存,重启 FreeCAD 生效", "Saved. Restart FreeCAD to apply."))
 
     def accept(self) -> bool:
         return True
@@ -1707,8 +1743,11 @@ def show_connection_settings() -> None:
 class ConnectionSettingsCommand:
     def GetResources(self):
         return {
-            "MenuText": "4yi: 连接设置...",
-            "ToolTip": "配置 4yi CAD Server URL / API Token,并测试连接。",
+            "MenuText": t("4yi: 连接设置...", "4yi: Connection Settings..."),
+            "ToolTip": t(
+                "配置 4yi CAD Server URL / API Token,并测试连接。",
+                "Configure the 4yi CAD Server URL / API Token and test the connection.",
+            ),
         }
 
     def Activated(self):
