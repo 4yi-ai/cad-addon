@@ -7,7 +7,9 @@ import json
 import locale
 import os
 import platform
+import queue
 import secrets
+import threading
 import time
 import traceback
 import urllib.error
@@ -229,6 +231,13 @@ def remote_overlay_env(
         "CAD_BRIDGE_POLL_INTERVAL_SECONDS": (
             base_env.get("CAD_BRIDGE_POLL_INTERVAL_SECONDS") or "10"
         ),
+        # A panel prompt runs the full cloud agent loop (LLM + FreeCADCmd), which
+        # takes tens of seconds. The kiosk image sets this to 300 in its env, but
+        # the remote overlay must carry it too or "Send Prompt" reads-time-out at
+        # the 10s default. An explicit env value still wins.
+        "CAD_PANEL_ACTION_HTTP_TIMEOUT_SECONDS": (
+            base_env.get("CAD_PANEL_ACTION_HTTP_TIMEOUT_SECONDS") or "300"
+        ),
     }
     if api_token:
         overlay["CAD_API_TOKEN"] = api_token
@@ -317,6 +326,70 @@ def app_console(level: str, message: str) -> None:
         console.PrintMessage(text)
     else:
         print(text)
+
+
+# --- Main-thread task pump -------------------------------------------------
+# FreeCAD's document/Qt objects are not thread-safe, so any work that touches
+# them must run on the GUI (main) thread. Background workers enqueue callables
+# here; a QTimer on the main thread drains and runs them. This lets slow HTTP
+# (panel prompts, generation) run off the GUI thread without freezing the UI,
+# while the results are applied back on the main thread.
+_MAIN_THREAD_TASKS: "queue.Queue" = queue.Queue()
+_MAIN_THREAD_PUMP = None
+
+
+def post_to_main_thread(fn) -> None:
+    """Queue a zero-arg callable to run on the GUI (main) thread."""
+    _MAIN_THREAD_TASKS.put(fn)
+
+
+def drain_main_thread_tasks() -> int:
+    """Run all queued main-thread tasks. Returns how many ran. Safe to call on
+    the main thread only (that is where the pump QTimer invokes it)."""
+    ran = 0
+    while True:
+        try:
+            fn = _MAIN_THREAD_TASKS.get_nowait()
+        except queue.Empty:
+            break
+        ran += 1
+        try:
+            fn()
+        except Exception as exc:
+            app_console("warning", "main-thread task failed: %s" % exc)
+    return ran
+
+
+def ensure_main_thread_pump() -> None:
+    global _MAIN_THREAD_PUMP
+    if QtCore is None or _MAIN_THREAD_PUMP is not None:
+        return
+    _MAIN_THREAD_PUMP = QtCore.QTimer()
+    _MAIN_THREAD_PUMP.setInterval(150)
+    _MAIN_THREAD_PUMP.timeout.connect(drain_main_thread_tasks)
+    _MAIN_THREAD_PUMP.start()
+
+
+def run_in_background(work, on_done) -> None:
+    """Run blocking `work()` off the GUI thread; deliver its result to
+    `on_done(result, error)` back on the main thread via the pump. Exactly one
+    of (result, error) is set. Falls back to synchronous when Qt is absent."""
+    if QtCore is None:
+        try:
+            on_done(work(), None)
+        except Exception as exc:
+            on_done(None, exc)
+        return
+    ensure_main_thread_pump()
+
+    def _runner() -> None:
+        try:
+            res = work()
+            post_to_main_thread(lambda: on_done(res, None))
+        except Exception as exc:
+            post_to_main_thread(lambda: on_done(None, exc))
+
+    threading.Thread(target=_runner, daemon=True).start()
 
 
 def active_document():
@@ -1565,25 +1638,37 @@ class CompanionTaskPanel:
         except Exception:
             self.output.setPlainText(json.dumps(current_selection(), ensure_ascii=False, indent=2))
 
+    def _run_action_async(self, work, pending_text: str) -> None:
+        # A panel action drives the cloud agent loop (tens of seconds). Run the
+        # HTTP off the GUI thread so the UI stays responsive; show the result
+        # back on the main thread when it returns. The generated model itself is
+        # loaded separately by the bridge poll's load_model command.
+        self.output.setPlainText(pending_text)
+
+        def done(result, error) -> None:
+            if error is not None:
+                self.output.setPlainText(str(error))
+            else:
+                self.output.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
+
+        run_in_background(work, done)
+
     def send_prompt(self) -> None:
-        try:
-            result = submit_prompt_from_panel(self.prompt_input.text())
-            self.output.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
-        except Exception as exc:
-            self.output.setPlainText(str(exc))
+        prompt = self.prompt_input.text()
+        self._run_action_async(
+            lambda: submit_prompt_from_panel(prompt),
+            t("已发送,云端生成中…(模型就绪后会自动载入)", "Sent — generating in the cloud… (the model loads when ready)"),
+        )
 
     def panel_action(self, action: str) -> None:
-        try:
-            result = submit_panel_action(
-                action,
-                {
-                    "prompt": self.prompt_input.text(),
-                    "patch_id": self.patch_id_input.text(),
-                },
-            )
-            self.output.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
-        except Exception as exc:
-            self.output.setPlainText(str(exc))
+        payload = {
+            "prompt": self.prompt_input.text(),
+            "patch_id": self.patch_id_input.text(),
+        }
+        self._run_action_async(
+            lambda: submit_panel_action(action, payload),
+            t("处理中…", "Working…"),
+        )
 
     def export_bundle(self) -> None:
         path = export_support_bundle()
