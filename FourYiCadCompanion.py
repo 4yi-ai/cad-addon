@@ -1428,18 +1428,27 @@ def macro_for_prompt_if_selected_numeric_edit(
 def submit_panel_action(action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = payload or {}
     env = EFFECTIVE_ENV
+    # GUI/document reads must happen on the main thread. When the caller runs
+    # this off the GUI thread (non-blocking panel actions) it pre-gathers these
+    # and passes them in; only fall back to a live read for main-thread callers.
+    selection = payload.get("selection")
+    if selection is None:
+        selection = current_selection()
+    document_tree = payload.get("document_tree")
+    if document_tree is None:
+        document_tree = current_document_tree()
     return post_json(
         panel_action_url(env),
         {
             "action": action,
             "prompt": payload.get("prompt"),
-            "selection": payload.get("selection") or current_selection(),
+            "selection": selection,
             "macro": payload.get("macro"),
             "patch_id": payload.get("patch_id"),
             "metadata": {
                 "source": "freecad_panel",
                 "addon_version": ADDON_VERSION,
-                "document_tree": current_document_tree(),
+                "document_tree": document_tree,
             },
         },
         panel_action_timeout(env),
@@ -1461,10 +1470,23 @@ def queue_bridge_command(op: str, payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def submit_prompt_from_panel(prompt: str) -> dict[str, Any]:
-    selection = current_selection()
+def submit_prompt_from_panel(
+    prompt: str,
+    selection: dict[str, Any] | None = None,
+    document_tree: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # selection/document_tree are pre-gathered on the main thread by the panel
+    # so this whole function can run on a background thread (pure HTTP). Only
+    # read live GUI state when called directly on the main thread.
+    if selection is None:
+        selection = current_selection()
     macro = macro_for_prompt_if_selected_numeric_edit(prompt, selection)
-    payload = {"prompt": prompt, "selection": selection, "macro": macro}
+    payload = {
+        "prompt": prompt,
+        "selection": selection,
+        "macro": macro,
+        "document_tree": document_tree,
+    }
     try:
         return submit_panel_action("prompt", payload)
     except Exception:
@@ -1639,13 +1661,20 @@ class CompanionTaskPanel:
             self.output.setPlainText(json.dumps(current_selection(), ensure_ascii=False, indent=2))
 
     def _run_action_async(self, work, pending_text: str) -> None:
-        # A panel action drives the cloud agent loop (tens of seconds). Run the
-        # HTTP off the GUI thread so the UI stays responsive; show the result
-        # back on the main thread when it returns. The generated model itself is
-        # loaded separately by the bridge poll's load_model command.
+        # A panel action drives the cloud agent loop (tens of seconds). `work`
+        # must be PURE HTTP — all GUI/document reads are gathered on the main
+        # thread by the caller and passed in as data. Run the HTTP off the GUI
+        # thread so the UI stays responsive; show the result back on the main
+        # thread. The generated model itself is loaded by the bridge poll's
+        # load_model command. A busy guard prevents overlapping requests from
+        # double-clicks (which would race and land out of order).
+        if getattr(self, "_action_busy", False):
+            return
+        self._action_busy = True
         self.output.setPlainText(pending_text)
 
         def done(result, error) -> None:
+            self._action_busy = False
             if error is not None:
                 self.output.setPlainText(str(error))
             else:
@@ -1655,8 +1684,12 @@ class CompanionTaskPanel:
 
     def send_prompt(self) -> None:
         prompt = self.prompt_input.text()
+        selection = current_selection()          # main thread
+        document_tree = current_document_tree()  # main thread
         self._run_action_async(
-            lambda: submit_prompt_from_panel(prompt),
+            lambda: submit_prompt_from_panel(
+                prompt, selection=selection, document_tree=document_tree
+            ),
             t("已发送,云端生成中…(模型就绪后会自动载入)", "Sent — generating in the cloud… (the model loads when ready)"),
         )
 
@@ -1664,6 +1697,8 @@ class CompanionTaskPanel:
         payload = {
             "prompt": self.prompt_input.text(),
             "patch_id": self.patch_id_input.text(),
+            "selection": current_selection(),          # main thread
+            "document_tree": current_document_tree(),   # main thread
         }
         self._run_action_async(
             lambda: submit_panel_action(action, payload),
