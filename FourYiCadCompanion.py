@@ -1379,7 +1379,10 @@ def parse_measurement_value(text: str) -> float | None:
 
 
 def macro_for_selected_numeric_edit(text: str, selection: dict[str, Any] | None = None) -> str:
-    selection = selection or current_selection()
+    # `is None` (not `or`): a pre-gathered selection must never fall through to a
+    # live GUI read, which would run off the main thread from a background action.
+    if selection is None:
+        selection = current_selection()
     active = selection.get("active_object") or {}
     object_name_value = active.get("name") or active.get("label") or ""
     value = parse_measurement_value(text)
@@ -1417,7 +1420,10 @@ def macro_for_prompt_if_selected_numeric_edit(
     text: str,
     selection: dict[str, Any] | None = None,
 ) -> str | None:
-    selection = selection or current_selection()
+    # `is None` (not `or`): a pre-gathered selection must never fall through to a
+    # live GUI read, which would run off the main thread from a background action.
+    if selection is None:
+        selection = current_selection()
     active = selection.get("active_object") or {}
     object_name_value = active.get("name") or active.get("label") or ""
     if not object_name_value or parse_measurement_value(text) is None:
