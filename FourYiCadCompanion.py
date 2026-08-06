@@ -1602,10 +1602,12 @@ def show_panel() -> None:
     global _PANEL_DIALOG
     panel = CompanionTaskPanel()
     _PANEL_DIALOG = panel
-    if Gui is not None and hasattr(Gui, "Control"):
-        Gui.Control.showDialog(panel)
-    else:
-        panel.form.show()
+    # Floating window rather than the Task panel: Gui.Control.showDialog raises
+    # "Active task dialog found" when another task dialog is up and no-ops on the
+    # Start page. A top-level QWidget.show() is reliable in every context.
+    panel.form.show()
+    panel.form.raise_()
+    panel.form.activateWindow()
 
 
 class OpenPanelCommand:
