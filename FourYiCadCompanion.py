@@ -71,8 +71,8 @@ def t(zh: str, en: str) -> str:
     return zh if _ui_language() == "zh" else en
 
 
-ADDON_VERSION = "0.4.1"
-USER_AGENT = "4yi-freecad-companion/0.4.1"
+ADDON_VERSION = "0.4.2"
+USER_AGENT = "4yi-freecad-companion/0.4.2"
 PARAM_GROUP_PATH = "User parameter:BaseApp/Preferences/Mod/FourYiCad"
 COMMAND_OPEN_PANEL = "FourYi_OpenPanel"
 COMMAND_START_BRIDGE = "FourYi_StartBridge"
@@ -1734,10 +1734,13 @@ def show_connection_settings() -> None:
     global _CONNECTION_SETTINGS_DIALOG
     dialog = ConnectionSettingsDialog()
     _CONNECTION_SETTINGS_DIALOG = dialog
-    if Gui is not None and hasattr(Gui, "Control"):
-        Gui.Control.showDialog(dialog)
-    else:
-        dialog.form.show()
+    # Show as a standalone floating window. Gui.Control.showDialog (the Task
+    # panel) silently no-ops on the Start page / without an active document, so
+    # the menu click appears to do nothing. A top-level QWidget.show() is
+    # reliable in every context.
+    dialog.form.show()
+    dialog.form.raise_()
+    dialog.form.activateWindow()
 
 
 class ConnectionSettingsCommand:
