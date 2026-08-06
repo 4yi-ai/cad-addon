@@ -222,6 +222,13 @@ def remote_overlay_env(
         "CAD_BRIDGE_HEARTBEAT_URL": "%s/api/freecad/sessions/%s/bridge/heartbeat" % (base, session_id),
         "CAD_BRIDGE_SAVE_URL": "%s/api/freecad/sessions/%s/save" % (base, session_id),
         "CAD_CONTROL_PLANE_URL": base,
+        # Remote mode polls the cloud over the internet on the GUI thread, so a
+        # tight interval visibly stutters the UI (kiosk mode talks to localhost
+        # and stays at its 2s default). Poll less often here until the bridge
+        # HTTP is moved off the GUI thread. An explicit env value still wins.
+        "CAD_BRIDGE_POLL_INTERVAL_SECONDS": (
+            base_env.get("CAD_BRIDGE_POLL_INTERVAL_SECONDS") or "10"
+        ),
     }
     if api_token:
         overlay["CAD_API_TOKEN"] = api_token
