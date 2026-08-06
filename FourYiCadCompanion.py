@@ -73,8 +73,8 @@ def t(zh: str, en: str) -> str:
     return zh if _ui_language() == "zh" else en
 
 
-ADDON_VERSION = "0.4.2"
-USER_AGENT = "4yi-freecad-companion/0.4.2"
+ADDON_VERSION = "0.4.3"
+USER_AGENT = "4yi-freecad-companion/0.4.3"
 PARAM_GROUP_PATH = "User parameter:BaseApp/Preferences/Mod/FourYiCad"
 COMMAND_OPEN_PANEL = "FourYi_OpenPanel"
 COMMAND_START_BRIDGE = "FourYi_StartBridge"
@@ -224,6 +224,14 @@ def remote_overlay_env(
         "CAD_BRIDGE_HEARTBEAT_URL": "%s/api/freecad/sessions/%s/bridge/heartbeat" % (base, session_id),
         "CAD_BRIDGE_SAVE_URL": "%s/api/freecad/sessions/%s/save" % (base, session_id),
         "CAD_CONTROL_PLANE_URL": base,
+        # Remote mode runs on the user's own machine, where the container's
+        # /workspace default is read-only; load_model would PermissionError
+        # writing the FCStd there. Write to a writable per-user dir. An explicit
+        # env value still wins.
+        "CAD_SESSION_WORKSPACE": (
+            base_env.get("CAD_SESSION_WORKSPACE")
+            or str(Path.home() / ".4yi-cad" / "workspace")
+        ),
         # Remote mode polls the cloud over the internet on the GUI thread, so a
         # tight interval visibly stutters the UI (kiosk mode talks to localhost
         # and stays at its 2s default). Poll less often here until the bridge
