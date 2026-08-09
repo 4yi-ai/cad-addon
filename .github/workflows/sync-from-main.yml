@@ -1,0 +1,77 @@
+name: Sync add-on from 4yi-cad
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-addon-from-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out distribution repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out source repository
+        uses: actions/checkout@v4
+        with:
+          repository: 4yi-ai/4yi-cad
+          ref: main
+          path: upstream
+          persist-credentials: false
+
+      - name: Sync add-on files
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="upstream/freecad-addon/fouryi_cad_companion"
+          cp "$source_dir/FourYiCadCompanion.py" FourYiCadCompanion.py
+          cp "$source_dir/InitGui.py" InitGui.py
+          cp "$source_dir/package.xml" package.xml
+          cp "$source_dir/README.md" README.md
+          rsync -a --delete "$source_dir/Resources/" Resources/
+
+      - name: Validate distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile FourYiCadCompanion.py InitGui.py
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          package = Path("package.xml").read_text(encoding="utf-8")
+          addon = Path("FourYiCadCompanion.py").read_text(encoding="utf-8")
+          package_version = re.search(r"<version>([^<]+)</version>", package).group(1)
+          addon_version = re.search(r'^ADDON_VERSION = "([^"]+)"', addon, re.MULTILINE).group(1)
+          if package_version != addon_version:
+              raise SystemExit(
+                  f"version mismatch: package.xml={package_version}, addon={addon_version}"
+              )
+          print(f"validated add-on version {addon_version}")
+          PY
+
+      - name: Commit synchronized files
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- . ':!upstream'; then
+            echo "Distribution is already current."
+            exit 0
+          fi
+          source_sha="$(git -C upstream rev-parse --short=12 HEAD)"
+          rm -rf upstream
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add FourYiCadCompanion.py InitGui.py package.xml README.md Resources
+          git commit -m "chore: sync add-on from 4yi-cad ${source_sha}"
+          git push

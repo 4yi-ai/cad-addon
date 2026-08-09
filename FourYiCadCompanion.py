@@ -8,9 +8,9 @@ import locale
 import os
 import platform
 import queue
+import re
 import secrets
 import threading
-import time
 import traceback
 import urllib.error
 import urllib.parse
@@ -73,8 +73,8 @@ def t(zh: str, en: str) -> str:
     return zh if _ui_language() == "zh" else en
 
 
-ADDON_VERSION = "0.4.3"
-USER_AGENT = "4yi-freecad-companion/0.4.3"
+ADDON_VERSION = "0.5.2"
+USER_AGENT = "4yi-freecad-companion/0.5.2"
 PARAM_GROUP_PATH = "User parameter:BaseApp/Preferences/Mod/FourYiCad"
 COMMAND_OPEN_PANEL = "FourYi_OpenPanel"
 COMMAND_START_BRIDGE = "FourYi_StartBridge"
@@ -378,7 +378,7 @@ def ensure_main_thread_pump() -> None:
     _MAIN_THREAD_PUMP.start()
 
 
-def run_in_background(work, on_done) -> None:
+def run_in_background(work, on_done) -> threading.Thread | None:
     """Run blocking `work()` off the GUI thread; deliver its result to
     `on_done(result, error)` back on the main thread via the pump. Exactly one
     of (result, error) is set. Falls back to synchronous when Qt is absent."""
@@ -387,7 +387,7 @@ def run_in_background(work, on_done) -> None:
             on_done(work(), None)
         except Exception as exc:
             on_done(None, exc)
-        return
+        return None
     ensure_main_thread_pump()
 
     def _runner() -> None:
@@ -395,9 +395,12 @@ def run_in_background(work, on_done) -> None:
             res = work()
             post_to_main_thread(lambda: on_done(res, None))
         except Exception as exc:
-            post_to_main_thread(lambda: on_done(None, exc))
+            error = exc
+            post_to_main_thread(lambda error=error: on_done(None, error))
 
-    threading.Thread(target=_runner, daemon=True).start()
+    worker = threading.Thread(target=_runner, daemon=True)
+    worker.start()
+    return worker
 
 
 def active_document():
@@ -821,6 +824,52 @@ def fit_active_view() -> None:
         pass
 
 
+def restore_loaded_model_visibility(doc) -> dict[str, Any]:
+    """Avoid a blank canvas when a headless-generated FCStd hides every shape."""
+    shape_objects = []
+    visible_count = 0
+    for obj in list(getattr(doc, "Objects", []) or []):
+        shape = getattr(obj, "Shape", None)
+        view = getattr(obj, "ViewObject", None)
+        if shape is None or view is None or not hasattr(view, "Visibility"):
+            continue
+        try:
+            if hasattr(shape, "isNull") and shape.isNull():
+                continue
+        except Exception:
+            continue
+        shape_objects.append(obj)
+        try:
+            if bool(view.Visibility):
+                visible_count += 1
+        except Exception:
+            pass
+
+    if not shape_objects:
+        return {"status": "no_shapes", "shape_object_count": 0, "restored_count": 0}
+    if visible_count:
+        return {
+            "status": "preserved",
+            "shape_object_count": len(shape_objects),
+            "visible_count": visible_count,
+            "restored_count": 0,
+        }
+
+    restored_count = 0
+    for obj in shape_objects:
+        try:
+            obj.ViewObject.Visibility = True
+            restored_count += 1
+        except Exception:
+            pass
+    return {
+        "status": "restored_all_hidden_shapes",
+        "shape_object_count": len(shape_objects),
+        "visible_count": restored_count,
+        "restored_count": restored_count,
+    }
+
+
 def execute_load_model(payload: dict[str, Any], env: dict[str, str], timeout: float) -> dict[str, Any]:
     if App is None:
         raise BridgeCommandError("freecad_unavailable", "FreeCAD is not available")
@@ -849,9 +898,12 @@ def execute_load_model(payload: dict[str, Any], env: dict[str, str], timeout: fl
     if doc is not None and payload.get("recompute", True) is not False and hasattr(doc, "recompute"):
         doc.recompute()
         recompute = {"status": "ok"}
+    visibility_restore = restore_loaded_model_visibility(doc)
     env["SESSION_FCSTD_PATH"] = str(path)
     if payload.get("version_id"):
         env["CAD_CURRENT_VERSION_ID"] = str(payload["version_id"])
+    if payload.get("workbench_session_id"):
+        env["CAD_WORKBENCH_SESSION_ID"] = str(payload["workbench_session_id"])
     fit_active_view()
     after_names = document_object_names(doc)
     append_event("model_loaded", {"path": str(path), "version_id": payload.get("version_id")})
@@ -865,6 +917,7 @@ def execute_load_model(payload: dict[str, Any], env: dict[str, str], timeout: fl
             "version_id": payload.get("version_id"),
         },
         "changed_objects": sorted(before_names ^ after_names),
+        "visibility_restore": visibility_restore,
         "console": ["Loaded %s" % path.name],
         "recompute_status": recompute,
         "undo": {"available": document_undo_available(doc), "source": "freecad_addon"},
@@ -1375,8 +1428,6 @@ def autostart_companion_panel() -> None:
 
 
 def parse_measurement_value(text: str) -> float | None:
-    import re
-
     matches = re.findall(r"(-?\d+(?:\.\d+)?)\s*(?:mm|毫米)?", text or "", flags=re.IGNORECASE)
     if not matches:
         return None
@@ -1384,6 +1435,279 @@ def parse_measurement_value(text: str) -> float | None:
         return float(matches[-1])
     except ValueError:
         return None
+
+
+EDITABLE_PROPERTY_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Height", ("height", "高度", "高")),
+    ("Width", ("width", "宽度", "宽")),
+    ("Length", ("length", "长度", "长")),
+    ("HoleDiameter", ("hole diameter", "holediameter", "孔径", "孔直径")),
+    ("Diameter", ("diameter", "直径", "孔")),
+    ("Radius", ("radius", "半径")),
+)
+
+
+def _serialized_scalar(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict) and isinstance(value.get("value"), (int, float)):
+        return float(value["value"])
+    return None
+
+
+def _quantity_mm(text: str) -> float | None:
+    matches = re.findall(
+        r"(-?\d+(?:\.\d+)?)\s*(mm|毫米|cm|厘米|m|米)?",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if not matches:
+        return None
+    value_text, unit = matches[-1]
+    value = float(value_text)
+    normalized = (unit or "mm").lower()
+    if normalized in {"m", "米"}:
+        return value * 1000.0
+    if normalized in {"cm", "厘米"}:
+        return value * 10.0
+    return value
+
+
+def _selected_object_summary(
+    selection: dict[str, Any],
+    document_tree: dict[str, Any],
+) -> dict[str, Any] | None:
+    active = selection.get("active_object") or {}
+    selected_name = str(active.get("name") or "")
+    selected_label = str(active.get("label") or "")
+    for item in list(document_tree.get("objects") or []):
+        if not isinstance(item, dict):
+            continue
+        if selected_name and item.get("name") == selected_name:
+            return item
+        if selected_label and item.get("label") == selected_label:
+            return item
+    return dict(active) if active else None
+
+
+def _requested_property(text: str, properties: dict[str, Any]) -> str | None:
+    lowered = (text or "").lower()
+    edit_words = r"增加|提高|升高|加高|加长|加宽|减少|降低|缩短|减小|改为|改成|设为|设置为|=|increase|raise|add|decrease|reduce|lower|set|change"
+    for property_name, aliases in EDITABLE_PROPERTY_ALIASES:
+        if property_name not in properties:
+            continue
+        for alias in aliases:
+            escaped = re.escape(alias)
+            if re.search(r"(?:%s).{0,16}(?:%s)|(?:%s).{0,16}(?:%s)" % (escaped, edit_words, edit_words, escaped), lowered):
+                return property_name
+    dimension_properties = [
+        name
+        for name, _aliases in EDITABLE_PROPERTY_ALIASES
+        if name in properties and _serialized_scalar(properties.get(name)) is not None
+    ]
+    # "把选中孔改成 6mm" is a common natural-language shorthand. Infer a
+    # target only when the selected object exposes exactly one safe dimension;
+    # otherwise ambiguity must fall back to the generative/clarification path.
+    return dimension_properties[0] if len(dimension_properties) == 1 else None
+
+
+def plan_natural_language_edit(
+    prompt: str,
+    selection: dict[str, Any] | None = None,
+    document_tree: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compile a small, auditable natural-language subset into typed CAD edits.
+
+    Unsupported or ambiguous instructions are deliberately routed to the
+    existing cloud revision generator. No Python is generated or executed.
+    """
+    selection = selection or {}
+    document_tree = document_tree or {}
+    active = _selected_object_summary(selection, document_tree)
+    target = {
+        "name": (active or {}).get("name"),
+        "label": (active or {}).get("label") or (active or {}).get("name"),
+        "type_id": (active or {}).get("type_id"),
+    }
+    properties = (active or {}).get("properties") or {}
+    property_name = _requested_property(prompt, properties) if active else None
+    requested_value = _quantity_mm(prompt)
+    old_value = _serialized_scalar(properties.get(property_name)) if property_name else None
+    has_explicit_unit = bool(re.search(r"-?\d+(?:\.\d+)?\s*(?:mm|毫米|cm|厘米|m|米)\b", prompt or "", re.IGNORECASE))
+    has_exact_assignment = bool(re.search(r"\b(?:Height|Width|Length|HoleDiameter|Diameter|Radius)\s*=", prompt or "", re.IGNORECASE))
+
+    if (
+        property_name
+        and requested_value is not None
+        and old_value is not None
+        and (has_explicit_unit or has_exact_assignment)
+    ):
+        lowered = (prompt or "").lower()
+        relative_down = bool(re.search(r"减少|降低|缩短|减小|decrease|reduce|lower", lowered))
+        relative_up = bool(re.search(r"增加|提高|升高|加高|加长|加宽|increase|raise|add", lowered))
+        if relative_down:
+            new_value = old_value - abs(requested_value)
+            operation_kind = "decrease"
+        elif relative_up:
+            new_value = old_value + abs(requested_value)
+            operation_kind = "increase"
+        else:
+            new_value = requested_value
+            operation_kind = "set"
+        if new_value <= 0:
+            return {
+                "schema": "4yi.freecad.edit_plan.v1",
+                "mode": "needs_clarification",
+                "scope": "selection",
+                "target": target,
+                "prompt": prompt,
+                "reason": t("修改后的尺寸必须大于 0 mm", "The resulting dimension must be greater than 0 mm"),
+                "operations": [],
+            }
+        return {
+            "schema": "4yi.freecad.edit_plan.v1",
+            "mode": "typed_property",
+            "scope": "selection",
+            "target": target,
+            "prompt": prompt,
+            "operations": [
+                {
+                    "op": "set_property",
+                    "selector": {"name": target["name"]},
+                    "property": property_name,
+                    "from": old_value,
+                    "value": new_value,
+                    "unit": "mm",
+                    "operation_kind": operation_kind,
+                }
+            ],
+            "invariants": [
+                t("仅修改当前选中对象", "Only modify the current selection"),
+                t("保持其他对象和其他属性不变", "Preserve all other objects and properties"),
+            ],
+            "warnings": [],
+        }
+
+    return {
+        "schema": "4yi.freecad.edit_plan.v1",
+        "mode": "generative_revision",
+        "scope": "selection" if active else "document",
+        "target": target if active else None,
+        "prompt": prompt,
+        "operations": [],
+        "invariants": [
+            t("保留当前文档作为基础版本", "Keep the current document as the base revision"),
+        ],
+        "warnings": [
+            t(
+                "该指令无法安全转换为本地参数修改，将生成新的云端版本。",
+                "This instruction cannot be compiled into a safe local parameter edit; a new cloud revision will be generated.",
+            )
+        ],
+    }
+
+
+def format_edit_plan(plan: dict[str, Any]) -> str:
+    target = plan.get("target") or {}
+    target_name = target.get("label") or target.get("name") or t("整个文档", "Entire document")
+    lines = [
+        t("修改计划", "Edit plan"),
+        t("目标：%s", "Target: %s") % target_name,
+        t("范围：%s", "Scope: %s")
+        % (t("仅选中对象", "Selection only") if plan.get("scope") == "selection" else t("整个文档", "Entire document")),
+    ]
+    for operation in plan.get("operations") or []:
+        lines.append(
+            t("操作：%s  %.3g mm → %.3g mm", "Operation: %s  %.3g mm → %.3g mm")
+            % (operation.get("property"), operation.get("from"), operation.get("value"))
+        )
+    if plan.get("mode") == "generative_revision":
+        lines.append(t("方式：生成新的云端模型版本", "Mode: Generate a new cloud model revision"))
+    if plan.get("reason"):
+        lines.append(t("需要确认：%s", "Needs clarification: %s") % plan["reason"])
+    for invariant in plan.get("invariants") or []:
+        lines.append(t("保持：%s", "Preserve: %s") % invariant)
+    for warning in plan.get("warnings") or []:
+        lines.append(t("注意：%s", "Note: %s") % warning)
+    return "\n".join(lines)
+
+
+def begin_typed_edit_preview(plan: dict[str, Any], doc=None) -> dict[str, Any]:
+    if plan.get("mode") != "typed_property" or len(plan.get("operations") or []) != 1:
+        raise BridgeCommandError("typed_edit_required", "A typed property edit plan is required")
+    doc = doc or active_document()
+    if doc is None:
+        raise BridgeCommandError("active_document_required", "No active FreeCAD document")
+    operation = plan["operations"][0]
+    object_name_value = (operation.get("selector") or {}).get("name")
+    obj = find_document_object(doc, str(object_name_value or ""))
+    if obj is None:
+        raise BridgeCommandError("selection_target_not_found", "Selected object was not found")
+    property_name = str(operation.get("property") or "")
+    if property_name not in {item[0] for item in EDITABLE_PROPERTY_ALIASES} or not hasattr(obj, property_name):
+        raise BridgeCommandError("property_not_editable", "Property is not in the safe edit allowlist")
+    actual_value = _serialized_scalar(serializable_value(getattr(obj, property_name)))
+    expected_value = float(operation["from"])
+    if actual_value is None or abs(actual_value - expected_value) > 1e-6:
+        raise BridgeCommandError(
+            "edit_conflict",
+            "The selected property changed after the plan was created",
+            details={"expected": expected_value, "actual": actual_value},
+        )
+    transaction_open = False
+    if hasattr(doc, "openTransaction"):
+        doc.openTransaction("4yi AI preview: %s" % property_name)
+        transaction_open = True
+    try:
+        setattr(obj, property_name, float(operation["value"]))
+        if hasattr(doc, "recompute"):
+            doc.recompute()
+    except Exception:
+        if transaction_open and hasattr(doc, "abortTransaction"):
+            doc.abortTransaction()
+        raise
+    return {
+        "schema": "4yi.freecad.edit_preview.v1",
+        "plan": plan,
+        "document": doc,
+        "object": obj,
+        "transaction_open": transaction_open,
+        "status": "preview_ready",
+    }
+
+
+def cancel_typed_edit_preview(preview: dict[str, Any]) -> None:
+    doc = preview.get("document")
+    if doc is None:
+        return
+    if preview.get("transaction_open") and hasattr(doc, "abortTransaction"):
+        doc.abortTransaction()
+    else:
+        operation = preview["plan"]["operations"][0]
+        setattr(preview["object"], operation["property"], float(operation["from"]))
+    if hasattr(doc, "recompute"):
+        doc.recompute()
+    preview["status"] = "cancelled"
+
+
+def commit_typed_edit_preview(preview: dict[str, Any]) -> None:
+    doc = preview.get("document")
+    if doc is None:
+        raise BridgeCommandError("active_document_required", "No active FreeCAD document")
+    if preview.get("transaction_open") and hasattr(doc, "commitTransaction"):
+        doc.commitTransaction()
+    preview["status"] = "applied"
+
+
+def undo_last_typed_edit(doc=None) -> None:
+    doc = doc or active_document()
+    if doc is None or not hasattr(doc, "undo"):
+        raise BridgeCommandError("undo_unavailable", "FreeCAD undo is not available")
+    doc.undo()
+    if hasattr(doc, "recompute"):
+        doc.recompute()
 
 
 def macro_for_selected_numeric_edit(text: str, selection: dict[str, Any] | None = None) -> str:
@@ -1459,6 +1783,7 @@ def submit_panel_action(action: str, payload: dict[str, Any] | None = None) -> d
             "selection": selection,
             "macro": payload.get("macro"),
             "patch_id": payload.get("patch_id"),
+            "base_version_id": env.get("CAD_CURRENT_VERSION_ID") or None,
             "metadata": {
                 "source": "freecad_panel",
                 "addon_version": ADDON_VERSION,
@@ -1494,19 +1819,16 @@ def submit_prompt_from_panel(
     # read live GUI state when called directly on the main thread.
     if selection is None:
         selection = current_selection()
-    macro = macro_for_prompt_if_selected_numeric_edit(prompt, selection)
     payload = {
         "prompt": prompt,
         "selection": selection,
-        "macro": macro,
+        # Natural-language edits are either compiled into the typed local edit
+        # path by CompanionTaskPanel or handled as a new cloud revision. Never
+        # attach executable Python to a user prompt.
+        "macro": None,
         "document_tree": document_tree,
     }
-    try:
-        return submit_panel_action("prompt", payload)
-    except Exception:
-        if macro:
-            return queue_bridge_command("run_macro", {"instruction": prompt, "selection": selection, "macro": macro})
-        raise
+    return submit_panel_action("prompt", payload)
 
 
 def redacted_environment(env: dict[str, str] | None = None) -> dict[str, Any]:
@@ -1576,7 +1898,57 @@ def export_support_bundle(env: dict[str, str] | None = None) -> Path:
     return path
 
 
-class CompanionTaskPanel:
+def capture_revision_payload(message: str, env: dict[str, str] | None = None) -> dict[str, Any]:
+    env = env or EFFECTIVE_ENV
+    doc = active_document()
+    if doc is None:
+        raise BridgeCommandError("active_document_required", "No active FreeCAD document")
+    root = workspace(env)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / ("panel-revision-%s.FCStd" % datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
+    if hasattr(doc, "saveCopy"):
+        doc.saveCopy(str(path))
+    elif hasattr(doc, "saveAs"):
+        doc.saveAs(str(path))
+    if not path.exists():
+        raise BridgeCommandError("fcstd_not_found", "Could not capture the active FreeCAD document")
+    preview_png_b64 = None
+    if Gui is not None:
+        preview_path = path.with_suffix(".png")
+        try:
+            Gui.ActiveDocument.ActiveView.saveImage(str(preview_path), 1200, 800, "Current")
+            if preview_path.exists():
+                preview_png_b64 = base64.b64encode(preview_path.read_bytes()).decode("ascii")
+        except Exception:
+            preview_png_b64 = None
+    return {
+        "message": message,
+        "fcstd_b64": base64.b64encode(path.read_bytes()).decode("ascii"),
+        "base_version_id": env.get("CAD_CURRENT_VERSION_ID") or None,
+        "preview_png_b64": preview_png_b64,
+        "artifacts": {},
+        "include_derivatives": True,
+    }
+
+
+def save_revision_payload(payload: dict[str, Any], env: dict[str, str] | None = None) -> dict[str, Any]:
+    env = env or EFFECTIVE_ENV
+    save_url = (env.get("CAD_BRIDGE_SAVE_URL") or "").strip()
+    if not save_url:
+        raise BridgeCommandError("save_url_not_configured", "CAD_BRIDGE_SAVE_URL is required")
+    result = post_json(
+        save_url,
+        payload,
+        panel_action_timeout(env),
+        env,
+    )
+    version = result.get("version") or {}
+    if version.get("id"):
+        env["CAD_CURRENT_VERSION_ID"] = str(version["id"])
+    return result
+
+
+class LegacyCompanionTaskPanel:
     def __init__(self) -> None:
         if QtWidgets is None:
             raise RuntimeError("Qt widgets are not available")
@@ -1730,15 +2102,378 @@ class CompanionTaskPanel:
         return True
 
 
+class CompanionTaskPanel:
+    """Review-first natural-language editing panel for native FreeCAD."""
+
+    def __init__(self) -> None:
+        if QtWidgets is None:
+            raise RuntimeError("Qt widgets are not available")
+        self._edit_plan: dict[str, Any] | None = None
+        self._preview: dict[str, Any] | None = None
+        self._action_busy = False
+        self.dock = None
+
+        self.form = QtWidgets.QWidget()
+        self.form.setWindowTitle("4yi AI")
+        self.form.setMinimumWidth(360)
+        layout = QtWidgets.QVBoxLayout(self.form)
+
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setWordWrap(True)
+        self.context_label = QtWidgets.QLabel("")
+        self.context_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.context_label)
+
+        self.output = QtWidgets.QPlainTextEdit()
+        self.output.setReadOnly(True)
+        layout.addWidget(self.output, 1)
+
+        self.prompt_input = QtWidgets.QTextEdit()
+        self.prompt_input.setPlaceholderText(
+            t(
+                "例如：将选中塔楼高度增加 10 米，保持宽度和位置不变",
+                "For example: increase the selected tower height by 10 m and preserve its width and position",
+            )
+        )
+        self.prompt_input.setMaximumHeight(82)
+        layout.addWidget(self.prompt_input)
+
+        primary = QtWidgets.QGridLayout()
+        self.plan_button = QtWidgets.QPushButton(t("生成修改计划", "Create edit plan"))
+        self.preview_button = QtWidgets.QPushButton(t("预览修改", "Preview changes"))
+        self.apply_button = QtWidgets.QPushButton(t("应用修改", "Apply changes"))
+        self.cancel_button = QtWidgets.QPushButton(t("取消预览", "Cancel preview"))
+        self.undo_button = QtWidgets.QPushButton(t("撤销上次修改", "Undo last change"))
+        primary.addWidget(self.plan_button, 0, 0, 1, 2)
+        primary.addWidget(self.preview_button, 1, 0)
+        primary.addWidget(self.apply_button, 1, 1)
+        primary.addWidget(self.cancel_button, 2, 0)
+        primary.addWidget(self.undo_button, 2, 1)
+        layout.addLayout(primary)
+        self.preview_button.setEnabled(False)
+        self.apply_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        self.undo_button.setEnabled(False)
+
+        self.advanced_group = QtWidgets.QGroupBox(t("连接与诊断", "Connection & diagnostics"))
+        self.advanced_group.setCheckable(True)
+        self.advanced_group.setChecked(False)
+        advanced = QtWidgets.QGridLayout(self.advanced_group)
+        self.refresh_button = QtWidgets.QPushButton(t("刷新上下文", "Refresh context"))
+        self.start_button = QtWidgets.QPushButton(t("启动桥接", "Start bridge"))
+        self.stop_button = QtWidgets.QPushButton(t("停止桥接", "Stop bridge"))
+        self.diagnostics_button = QtWidgets.QPushButton(t("查看诊断", "View diagnostics"))
+        self.bundle_button = QtWidgets.QPushButton(t("导出支持包", "Export support bundle"))
+        advanced.addWidget(self.refresh_button, 0, 0)
+        advanced.addWidget(self.start_button, 0, 1)
+        advanced.addWidget(self.stop_button, 1, 0)
+        advanced.addWidget(self.diagnostics_button, 1, 1)
+        advanced.addWidget(self.bundle_button, 2, 0, 1, 2)
+        layout.addWidget(self.advanced_group)
+
+        self.plan_button.clicked.connect(self.prepare_plan)
+        self.preview_button.clicked.connect(self.preview_edit)
+        self.apply_button.clicked.connect(self.apply_edit)
+        self.cancel_button.clicked.connect(self.cancel_preview)
+        self.undo_button.clicked.connect(self.undo_edit)
+        self.refresh_button.clicked.connect(self.refresh)
+        self.start_button.clicked.connect(self.start_bridge)
+        self.stop_button.clicked.connect(self.stop_bridge)
+        self.diagnostics_button.clicked.connect(self.show_diagnostics)
+        self.bundle_button.clicked.connect(self.export_bundle)
+
+        self.context_timer = None
+        if QtCore is not None:
+            self.context_timer = QtCore.QTimer(self.form)
+            self.context_timer.setInterval(1000)
+            self.context_timer.timeout.connect(self.refresh_context)
+            self.context_timer.start()
+        self.refresh()
+
+    def _prompt_text(self) -> str:
+        return (self.prompt_input.toPlainText() or "").strip()
+
+    def _append_output(self, text: str) -> None:
+        current = self.output.toPlainText().strip()
+        self.output.setPlainText((current + "\n\n" + text).strip())
+
+    def refresh_context(self) -> None:
+        self._recover_finished_action()
+        diagnostics = collect_diagnostics()
+        active = diagnostics["selection"].get("active_object") or {}
+        doc = diagnostics["document_tree"].get("document") or {}
+        version = EFFECTIVE_ENV.get("CAD_CURRENT_VERSION_ID") or t("本地未同步", "local / unsynced")
+        if len(version) > 12:
+            version = version[:12]
+        bridge_state = (
+            t("桥接运行中", "Bridge connected")
+            if diagnostics["bridge"]["running"]
+            else t("桥接已停止", "Bridge stopped")
+        )
+        self.status_label.setText(t("● %s  ·  版本 %s", "● %s  ·  Revision %s") % (bridge_state, version))
+        self.context_label.setText(
+            t("文档：%s\n修改范围：%s", "Document: %s\nEdit scope: %s")
+            % (
+                doc.get("label") or doc.get("name") or t("无", "none"),
+                active.get("label")
+                or active.get("name")
+                or t("整个文档（未选择对象）", "Entire document (nothing selected)"),
+            )
+        )
+
+    def refresh(self) -> None:
+        self.refresh_context()
+        if not self.output.toPlainText().strip():
+            self.output.setPlainText(
+                t(
+                    "选择一个对象，输入自然语言修改指令，然后点击“生成修改计划”。\n\n"
+                    "安全参数修改会先在当前画布中预览；复杂设计修改会生成新的云端版本。",
+                    "Select an object, enter a natural-language instruction, then choose Create edit plan.\n\n"
+                    "Safe parameter edits preview in the current canvas; complex design changes create a new cloud revision.",
+                )
+            )
+
+    def prepare_plan(self) -> None:
+        if self._action_busy:
+            return
+        if self._preview is not None:
+            self.cancel_preview()
+        prompt = self._prompt_text()
+        if not prompt:
+            self.output.setPlainText(t("请先输入修改指令。", "Enter an edit instruction first."))
+            return
+        self._edit_plan = plan_natural_language_edit(
+            prompt,
+            current_selection(),
+            current_document_tree(),
+        )
+        self.output.setPlainText(format_edit_plan(self._edit_plan))
+        mode = self._edit_plan.get("mode")
+        self.preview_button.setEnabled(mode == "typed_property")
+        self.apply_button.setEnabled(mode == "generative_revision")
+        self.apply_button.setText(
+            t("生成新版本", "Generate revision")
+            if mode == "generative_revision"
+            else t("应用修改", "Apply changes")
+        )
+        self.cancel_button.setEnabled(False)
+
+    def preview_edit(self) -> None:
+        if not self._edit_plan or self._edit_plan.get("mode") != "typed_property":
+            return
+        try:
+            self._preview = begin_typed_edit_preview(self._edit_plan)
+            self._append_output(
+                t(
+                    "预览已显示在三维画布中。请检查目标对象和尺寸，然后应用或取消。",
+                    "The preview is visible in the 3D canvas. Review the target and dimensions, then apply or cancel.",
+                )
+            )
+            self.preview_button.setEnabled(False)
+            self.apply_button.setEnabled(True)
+            self.cancel_button.setEnabled(True)
+            self.plan_button.setEnabled(False)
+            self.prompt_input.setEnabled(False)
+        except Exception as exc:
+            self.output.setPlainText(t("无法生成预览：%s", "Could not create preview: %s") % exc)
+
+    def apply_edit(self) -> None:
+        if not self._edit_plan or self._action_busy:
+            return
+        if self._edit_plan.get("mode") == "generative_revision":
+            self._generate_revision()
+            return
+        if self._preview is None:
+            self.output.setPlainText(t("请先预览修改。", "Preview the change before applying it."))
+            return
+        try:
+            commit_typed_edit_preview(self._preview)
+            self._preview = None
+            self.cancel_button.setEnabled(False)
+            self.apply_button.setEnabled(False)
+            self.undo_button.setEnabled(True)
+            self.plan_button.setEnabled(True)
+            self.prompt_input.setEnabled(True)
+            self._append_output(t("修改已应用，正在保存新版本…", "Change applied; saving a new revision…"))
+            self._save_current_revision(self._prompt_text())
+        except Exception as exc:
+            self.output.setPlainText(t("应用失败：%s", "Apply failed: %s") % exc)
+
+    def cancel_preview(self) -> None:
+        if self._preview is not None:
+            try:
+                cancel_typed_edit_preview(self._preview)
+            except Exception as exc:
+                self.output.setPlainText(t("取消预览失败：%s", "Could not cancel preview: %s") % exc)
+                return
+        self._preview = None
+        typed = bool(self._edit_plan and self._edit_plan.get("mode") == "typed_property")
+        generative = bool(self._edit_plan and self._edit_plan.get("mode") == "generative_revision")
+        self.preview_button.setEnabled(typed)
+        self.apply_button.setEnabled(generative)
+        self.cancel_button.setEnabled(False)
+        self.plan_button.setEnabled(True)
+        self.prompt_input.setEnabled(True)
+        self._append_output(t("预览已取消，模型已恢复。", "Preview cancelled; the model was restored."))
+
+    def undo_edit(self) -> None:
+        if self._action_busy:
+            return
+        try:
+            undo_last_typed_edit()
+            self.undo_button.setEnabled(False)
+            self._append_output(t("上次修改已撤销，正在保存恢复版本…", "The last change was undone; saving the restored revision…"))
+            self._save_current_revision(t("撤销：%s", "Undo: %s") % self._prompt_text())
+        except Exception as exc:
+            self.output.setPlainText(t("撤销失败：%s", "Undo failed: %s") % exc)
+
+    def _generate_revision(self) -> None:
+        prompt = self._prompt_text()
+        selection = current_selection()
+        document_tree = current_document_tree()
+        self._run_action_async(
+            lambda: submit_prompt_from_panel(prompt, selection=selection, document_tree=document_tree),
+            t(
+                "已提交生成式修改。云端完成后会自动载入新版本，请保持桥接运行。",
+                "Generative edit submitted. The new revision loads automatically when ready; keep the bridge connected.",
+            ),
+            on_success=lambda _result: self._append_output(
+                t("任务已进入云端生成队列。", "The task is now in the cloud generation queue.")
+            ),
+        )
+
+    def _save_current_revision(self, message: str) -> None:
+        try:
+            payload = capture_revision_payload(message)
+        except Exception as exc:
+            self._append_output(
+                t("本地修改已完成，但版本快照失败：%s", "The local edit succeeded, but the revision snapshot failed: %s") % exc
+            )
+            return
+        if not (EFFECTIVE_ENV.get("CAD_BRIDGE_SAVE_URL") or "").strip():
+            self._append_output(
+                t("本地修改已完成；当前连接未配置云端版本保存。", "The local edit succeeded; cloud revision saving is not configured.")
+            )
+            return
+        self._run_action_async(
+            lambda: save_revision_payload(payload),
+            t("正在保存新版本…", "Saving a new revision…"),
+            on_success=self._revision_saved,
+        )
+
+    def _revision_saved(self, result: dict[str, Any]) -> None:
+        version = result.get("version") or {}
+        version_label = version.get("version_number") or str(version.get("id") or "")[:12]
+        self._append_output(t("版本 %s 已保存。", "Revision %s saved.") % version_label)
+        self.refresh_context()
+
+    def start_bridge(self) -> None:
+        try:
+            start_remote_bridge()
+            self.refresh_context()
+        except Exception as exc:
+            self.output.setPlainText(str(exc))
+
+    def stop_bridge(self) -> None:
+        stop_remote_bridge()
+        self.refresh_context()
+
+    def show_diagnostics(self) -> None:
+        self.output.setPlainText(json.dumps(collect_diagnostics(), ensure_ascii=False, indent=2))
+
+    def _run_action_async(self, work, pending_text: str, on_success=None) -> None:
+        if self._action_busy:
+            return
+        self._action_busy = True
+        self._action_thread = None
+        self._append_output(pending_text)
+        self.plan_button.setEnabled(False)
+        self.apply_button.setEnabled(False)
+
+        def done(result, error) -> None:
+            self._action_busy = False
+            self._action_thread = None
+            self.plan_button.setEnabled(True)
+            if error is not None:
+                self._append_output(t("操作失败：%s", "Operation failed: %s") % error)
+                if self._edit_plan and self._edit_plan.get("mode") == "generative_revision":
+                    self.apply_button.setEnabled(True)
+            elif on_success is not None:
+                on_success(result or {})
+            else:
+                self._append_output(t("操作完成。", "Operation completed."))
+
+        self._action_thread = run_in_background(work, done)
+
+    def _recover_finished_action(self) -> None:
+        """Drain a completed worker callback even if FreeCAD's global Qt pump stalled."""
+        worker = getattr(self, "_action_thread", None)
+        if not self._action_busy or worker is None or worker.is_alive():
+            return
+        drain_main_thread_tasks()
+        if self._action_busy:
+            self._action_busy = False
+            self._action_thread = None
+            self.plan_button.setEnabled(True)
+            if self._edit_plan and self._edit_plan.get("mode") == "generative_revision":
+                self.apply_button.setEnabled(True)
+            self._append_output(
+                t(
+                    "后台操作已结束，但结果回调未送达；控件已恢复，请重试或查看诊断。",
+                    "The background action ended without delivering its callback; controls were restored. Retry or inspect diagnostics.",
+                )
+            )
+
+    def export_bundle(self) -> None:
+        path = export_support_bundle()
+        self.output.setPlainText(t("支持包已写入 %s", "Support bundle written to %s") % path)
+
+    def accept(self) -> bool:
+        if self._preview is not None:
+            self.cancel_preview()
+        return True
+
+    def reject(self) -> bool:
+        if self._preview is not None:
+            self.cancel_preview()
+        return True
+
+
 def show_panel() -> None:
     if QtWidgets is None:
         raise RuntimeError("Qt widgets are not available")
     global _PANEL_DIALOG
+    if _PANEL_DIALOG is not None:
+        existing = getattr(_PANEL_DIALOG, "dock", None) or getattr(_PANEL_DIALOG, "form", None)
+        if existing is not None:
+            try:
+                existing.show()
+                existing.raise_()
+                return
+            except Exception:
+                pass
     panel = CompanionTaskPanel()
     _PANEL_DIALOG = panel
-    # Floating window rather than the Task panel: Gui.Control.showDialog raises
-    # "Active task dialog found" when another task dialog is up and no-ops on the
-    # Start page. A top-level QWidget.show() is reliable in every context.
+    main_window = None
+    if Gui is not None and hasattr(Gui, "getMainWindow"):
+        try:
+            main_window = Gui.getMainWindow()
+        except Exception:
+            main_window = None
+    if main_window is not None and hasattr(QtWidgets, "QDockWidget"):
+        dock = QtWidgets.QDockWidget("4yi AI", main_window)
+        dock.setObjectName("FourYiCadAssistantDock")
+        dock.setWidget(panel.form)
+        area = getattr(QtCore.Qt, "RightDockWidgetArea", None)
+        if area is None and hasattr(QtCore.Qt, "DockWidgetArea"):
+            area = QtCore.Qt.DockWidgetArea.RightDockWidgetArea
+        main_window.addDockWidget(area, dock)
+        panel.dock = dock
+        dock.show()
+        dock.raise_()
+        return
+    # Keep a floating fallback for unusual FreeCAD builds without dock support.
     panel.form.show()
     panel.form.raise_()
     panel.form.activateWindow()
