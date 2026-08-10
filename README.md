@@ -13,12 +13,20 @@ It has two modes:
   the addon autostarts an in-process bridge that reads real `FreeCADGui`
   selection/document state and executes bridge commands in FreeCAD transactions.
 
-## Manual Install
+## Install with FreeCAD Addon Manager
 
-The current source of truth is the
-[`4yi-ai/4yi-cad`](https://github.com/4yi-ai/4yi-cad) repository. Do not install
-from the old standalone `4yi-ai/cad-addon` repository: it is not automatically
-synchronized with this repository.
+The distribution repository is automatically synchronized from the
+[`4yi-ai/4yi-cad`](https://github.com/4yi-ai/4yi-cad) source repository.
+
+1. Open FreeCAD **Preferences → Addon Manager**.
+2. Under **Custom repositories**, click **+**.
+3. Set **Repository URL** to `https://github.com/4yi-ai/cad-addon` and
+   **Branch** to `main`.
+4. Open **Tools → Addon Manager**, search for **4yi CAD Companion**, and install.
+5. Restart FreeCAD and switch to the **4yi CAD** workbench.
+6. Open **4yi Support Bundle** and verify `addon_version` is `0.5.2`.
+
+## Manual ZIP fallback
 
 1. In FreeCAD, open **View → Panels → Python console**, then run
    `print(App.getUserAppDataDir() + "Mod")`. The printed value is the

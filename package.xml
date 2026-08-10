@@ -7,7 +7,7 @@
   <description>Review-first natural-language CAD editing panel and remote-session bridge for FreeCAD.</description>
   <maintainer email="support@4yi.ai">4yi CAD</maintainer>
   <license>Proprietary</license>
-  <url type="repository" branch="main">https://github.com/4yi-ai/4yi-cad</url>
+  <url type="repository" branch="main">https://github.com/4yi-ai/cad-addon</url>
   <icon>Resources/icons/fouryi_cad_companion.svg</icon>
   <content>
     <workbench>
