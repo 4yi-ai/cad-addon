@@ -22,7 +22,9 @@ The distribution repository is automatically synchronized from the
 2. Under **Custom repositories**, click **+**.
 3. Set **Repository URL** to `https://github.com/4yi-ai/cad-addon` and
    **Branch** to `main`.
-4. Open **Tools → Addon Manager**, search for **4yi CAD Companion**, and install.
+4. Open **Tools → Addon Manager**, search for the repository name
+   **cad-addon**, and install. FreeCAD 1.1 custom-repository search does not
+   initially match the display name **4yi CAD Companion**.
 5. Restart FreeCAD and switch to the **4yi CAD** workbench.
 6. Open **4yi Support Bundle** and verify `addon_version` is `0.5.2`.
 
