@@ -407,6 +407,17 @@ def active_document():
     return getattr(App, "ActiveDocument", None) if App is not None else None
 
 
+def active_document_starts_new_model(env: dict[str, str] | None = None) -> bool:
+    """Return true when the user moved from a loaded cloud model to a new local document."""
+    env = env or EFFECTIVE_ENV
+    if not env.get("CAD_CURRENT_VERSION_ID"):
+        return False
+    bound_name = env.get("CAD_BOUND_DOCUMENT_NAME")
+    doc = active_document()
+    active_name = str(getattr(doc, "Name", "") or "") if doc is not None else ""
+    return bool(bound_name and active_name and active_name != bound_name)
+
+
 def freecad_version() -> str:
     if App is None:
         return "unavailable"
@@ -902,6 +913,8 @@ def execute_load_model(payload: dict[str, Any], env: dict[str, str], timeout: fl
     env["SESSION_FCSTD_PATH"] = str(path)
     if payload.get("version_id"):
         env["CAD_CURRENT_VERSION_ID"] = str(payload["version_id"])
+    if doc is not None and getattr(doc, "Name", None):
+        env["CAD_BOUND_DOCUMENT_NAME"] = str(doc.Name)
     if payload.get("workbench_session_id"):
         env["CAD_WORKBENCH_SESSION_ID"] = str(payload["workbench_session_id"])
     fit_active_view()
@@ -1775,6 +1788,7 @@ def submit_panel_action(action: str, payload: dict[str, Any] | None = None) -> d
     document_tree = payload.get("document_tree")
     if document_tree is None:
         document_tree = current_document_tree()
+    start_new_model = bool(payload.get("start_new_model"))
     return post_json(
         panel_action_url(env),
         {
@@ -1783,7 +1797,8 @@ def submit_panel_action(action: str, payload: dict[str, Any] | None = None) -> d
             "selection": selection,
             "macro": payload.get("macro"),
             "patch_id": payload.get("patch_id"),
-            "base_version_id": env.get("CAD_CURRENT_VERSION_ID") or None,
+            "base_version_id": None if start_new_model else env.get("CAD_CURRENT_VERSION_ID") or None,
+            "start_new_model": start_new_model,
             "metadata": {
                 "source": "freecad_panel",
                 "addon_version": ADDON_VERSION,
@@ -1813,6 +1828,7 @@ def submit_prompt_from_panel(
     prompt: str,
     selection: dict[str, Any] | None = None,
     document_tree: dict[str, Any] | None = None,
+    start_new_model: bool = False,
 ) -> dict[str, Any]:
     # selection/document_tree are pre-gathered on the main thread by the panel
     # so this whole function can run on a background thread (pure HTTP). Only
@@ -1827,6 +1843,7 @@ def submit_prompt_from_panel(
         # attach executable Python to a user prompt.
         "macro": None,
         "document_tree": document_tree,
+        "start_new_model": start_new_model,
     }
     return submit_panel_action("prompt", payload)
 
@@ -2203,7 +2220,10 @@ class CompanionTaskPanel:
         diagnostics = collect_diagnostics()
         active = diagnostics["selection"].get("active_object") or {}
         doc = diagnostics["document_tree"].get("document") or {}
-        version = EFFECTIVE_ENV.get("CAD_CURRENT_VERSION_ID") or t("本地未同步", "local / unsynced")
+        if active_document_starts_new_model():
+            version = t("本地新模型", "new local model")
+        else:
+            version = EFFECTIVE_ENV.get("CAD_CURRENT_VERSION_ID") or t("本地未同步", "local / unsynced")
         if len(version) > 12:
             version = version[:12]
         bridge_state = (
@@ -2332,8 +2352,14 @@ class CompanionTaskPanel:
         prompt = self._prompt_text()
         selection = current_selection()
         document_tree = current_document_tree()
+        start_new_model = active_document_starts_new_model()
         self._run_action_async(
-            lambda: submit_prompt_from_panel(prompt, selection=selection, document_tree=document_tree),
+            lambda: submit_prompt_from_panel(
+                prompt,
+                selection=selection,
+                document_tree=document_tree,
+                start_new_model=start_new_model,
+            ),
             t(
                 "已提交生成式修改。云端完成后会自动载入新版本，请保持桥接运行。",
                 "Generative edit submitted. The new revision loads automatically when ready; keep the bridge connected.",
