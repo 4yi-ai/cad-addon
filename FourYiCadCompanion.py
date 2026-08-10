@@ -410,12 +410,18 @@ def active_document():
 def active_document_starts_new_model(env: dict[str, str] | None = None) -> bool:
     """Return true when the user moved from a loaded cloud model to a new local document."""
     env = env or EFFECTIVE_ENV
-    if not env.get("CAD_CURRENT_VERSION_ID"):
+    doc = active_document()
+    if doc is None:
         return False
     bound_name = env.get("CAD_BOUND_DOCUMENT_NAME")
-    doc = active_document()
-    active_name = str(getattr(doc, "Name", "") or "") if doc is not None else ""
-    return bool(bound_name and active_name and active_name != bound_name)
+    active_name = str(getattr(doc, "Name", "") or "")
+    # Until load_model explicitly binds a FreeCAD document to a cloud revision,
+    # any active local document is a new model boundary. This includes a fresh
+    # Unnamed document immediately after restarting FreeCAD, when the remote
+    # session can still retain an older current_version_id.
+    if not bound_name:
+        return bool(active_name)
+    return bool(active_name and active_name != bound_name)
 
 
 def freecad_version() -> str:
